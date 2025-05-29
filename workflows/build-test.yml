@@ -1,0 +1,203 @@
+name: CI Build, Test, and Security Scan
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+env:
+  PYTHON_VERSION: "3.10"
+  POETRY_VERSION: "1.7.0"
+  DOCKER_REGISTRY: "ghcr.io"
+  IMAGE_NAME: "biconic-ai/core"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+        include:
+          - python-version: "3.10"
+            experimental: false
+          - python-version: "3.11"
+            experimental: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        submodules: recursive
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'poetry'
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev libev-dev
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: ${{ env.POETRY_VERSION }}
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Configure Poetry
+      run: |
+        poetry config virtualenvs.in-project true
+        poetry config virtualenvs.create true
+
+    - name: Install Python dependencies
+      run: |
+        poetry install --no-root --with dev,test,security --all-extras
+        poetry export --with dev,test,security --all-extras --format=requirements.txt --output requirements.txt
+
+    - name: Lint with Black
+      run: poetry run black --check --diff src/ tests/
+
+    - name: Static type checking with Mypy
+      run: |
+        poetry run mypy --install-types --non-interactive \
+          --config-file pyproject.toml \
+          --namespace-packages \
+          src/
+
+    - name: Security scan with Bandit
+      run: |
+        poetry run bandit -r src/ -c pyproject.toml
+
+    - name: Run unit tests
+      run: |
+        poetry run pytest tests/unit/ \
+          --junitxml=junit/unit-tests.xml \
+          --cov=src \
+          --cov-report=xml:coverage.xml \
+          --cov-report=html:htmlcov
+      env:
+        PYTHONPATH: src/
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: coverage.xml
+        flags: unittests
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: unit-test-results-${{ matrix.python-version }}
+        path: |
+          junit/unit-tests.xml
+          htmlcov/
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-22.04
+    needs: build-and-test
+    services:
+      kafka:
+        image: bitnami/kafka:3.6
+        ports: ["9092:9092"]
+        env:
+          KAFKA_CFG_NODE_ID: 0
+          KAFKA_CFG_PROCESS_ROLES: controller,broker
+          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
+          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      postgres:
+        image: postgres:15-alpine
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install dependencies
+      run: poetry install --with test,integration
+
+    - name: Wait for services
+      timeout-minutes: 5
+      run: |
+        poetry run python scripts/wait_for_services.py \
+          --kafka kafka:9092 \
+          --postgres localhost:5432
+
+    - name: Run integration tests
+      run: |
+        poetry run pytest tests/integration/ \
+          --junitxml=junit/integration-tests.xml
+      env:
+        KAFKA_BOOTSTRAP_SERVERS: "localhost:9092"
+        POSTGRES_URI: "postgresql://testuser:testpass@localhost:5432/testdb"
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: integration-test-results
+        path: junit/integration-tests.xml
+
+  security-scan:
+    name: Container Vulnerability Scan
+    runs-on: ubuntu-22.04
+    needs: build-and-test
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build Docker image
+      run: |
+        docker build -t $DOCKER_REGISTRY/$IMAGE_NAME:$GITHUB_SHA \
+          --build-arg PYTHON_VERSION=${{ env.PYTHON_VERSION }} \
+          -f Dockerfile .
+
+    - name: Scan with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: $DOCKER_REGISTRY/$IMAGE_NAME:$GITHUB_SHA
+        format: 'sarif'
+        output: trivy-results.sarif
+        severity: 'CRITICAL,HIGH'
+
+    - name: Upload SARIF report
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: trivy-results.sarif
+
+  notify-failure:
+    name: Notification
+    if: ${{ failure() }}
+    runs-on: ubuntu-22.04
+    needs: [build-and-test, integration-tests, security-scan]
+    steps:
+    - name: Send Slack notification
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_CI_WEBHOOK }}
+        SLACK_COLOR: danger
+        SLACK_TITLE: "CI Pipeline Failed"
+        SLACK_MESSAGE: "Workflow ${{ github.workflow }} failed for ${{ github.ref }}"
+      # Uncomment to enable Slack notifications
+      # if: always()
