@@ -1,0 +1,188 @@
+name: Security Scanning Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "*" ]
+  schedule:
+    - cron: '0 3 * * 1'  # Weekly scans every Monday 3 AM UTC
+
+env:
+  DOCKER_IMAGE: ghcr.io/${{ github.repository }}:security-scan
+  SARIF_DIR: ./security-reports
+  SBOM_DIR: ./sbom
+  SLACK_CHANNEL: "C123456"  # Your Slack channel ID
+
+jobs:
+  static-analysis:
+    name: Static Code Analysis
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        language: [python, yaml, dockerfile]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install analysis tools
+      run: |
+        pip install bandit semgrep safety
+        curl -L https://github.com/securego/gosec/releases/download/v2.18.0/gosec_2.18.0_linux_amd64.tar.gz | tar xz
+        sudo mv gosec /usr/local/bin/
+
+    - name: Bandit scan (Python SAST)
+      if: matrix.language == 'python'
+      run: |
+        bandit -r src/ \
+          -f json \
+          -o $SARIF_DIR/bandit-${{ matrix.language }}.json \
+          --confidence-level high \
+          --severity-level high
+
+    - name: Semgrep custom rules scan
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: p/ci
+        output: $SARIF_DIR/semgrep-${{ matrix.language }}.sarif
+      env:
+        SEMGREP_RULES: |
+          - id: insecure-deserialization
+            pattern: pickle.loads(...)
+            message: "Insecure deserialization detected"
+            languages: [python]
+            severity: ERROR
+
+    - name: Gosec scan (Go security)
+      if: matrix.language == 'yaml'
+      run: |
+        gosec -fmt=sarif -out=$SARIF_DIR/gosec.sarif ./...
+
+  container-security:
+    name: Container & Dependency Security
+    runs-on: ubuntu-22.04
+    needs: static-analysis
+    steps:
+    - name: Build Docker image
+      run: |
+        docker build -t $DOCKER_IMAGE .
+
+    - name: Trivy vulnerability scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: $DOCKER_IMAGE
+        format: 'sarif'
+        output: $SARIF_DIR/trivy.sarif
+        severity: 'CRITICAL,HIGH'
+        scanners: 'vuln,config,secret'
+        ignore-unfixed: false
+        exit-code: 0
+
+    - name: Syft SBOM generation
+      run: |
+        docker run --rm \
+          -v "$(pwd)":/sbom \
+          anchore/syft:latest \
+          $DOCKER_IMAGE \
+          -o spdx-json=/sbom/$SBOM_DIR/sbom.spdx.json
+
+    - name: OWASP Dependency-Check
+      uses: dependency-check/Dependency-Check@main
+      with:
+        project: 'aelion-ai'
+        scanPath: './src'
+        format: 'SARIF'
+        outputDirectory: $SARIF_DIR
+
+  secrets-detection:
+    name: Secrets & Credentials Detection
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: TruffleHog advanced scan
+      uses: trufflesecurity/trufflehog@main
+      with:
+        args: |
+          --regex
+          --entropy=6
+          --rules ./security/rules.json
+          --json
+          --exclude-paths ./security/excludes.txt
+          file://.
+      env:
+        TRUFFLEHOG_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  compliance:
+    name: Compliance Checks
+    runs-on: ubuntu-22.04
+    steps:
+    - name: CIS Docker Benchmark
+      run: |
+        docker run --rm \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          -v "$(pwd)/compliance":/compliance \
+          docker/docker-bench-security:latest \
+          -l /compliance/cis-docker.log
+
+    - name: PCI-DSS Quick Scan
+      uses: mitre/heimdall@v2
+      with:
+        profile: pci-dss
+        input: ./src
+        output: $SARIF_DIR/pci-dss.sarif
+
+  report:
+    name: Security Reporting
+    runs-on: ubuntu-22.04
+    needs: [static-analysis, container-security, secrets-detection, compliance]
+    steps:
+    - name: Upload SARIF reports
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_dir: $SARIF_DIR
+
+    - name: Generate SBOM attestation
+      run: |
+        cosign attest --predicate $SBOM_DIR/sbom.spdx.json \
+          --key env://COSIGN_KEY \
+          --type spdxjson \
+          $DOCKER_IMAGE
+      env:
+        COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+
+    - name: Send Slack alert
+      if: failure()
+      uses: slackapi/slack-github-action@v1.25.0
+      with:
+        channel-id: ${{ env.SLACK_CHANNEL }}
+        slack-message: |
+          :red_circle: Security scan failed in ${{ github.repository }} (Run ID: ${{ github.run_id }})
+          View details: https://github.com/${{ github.repository }}/security/code-scanning
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  auto-remediation:
+    name: Auto Remediation
+    runs-on: ubuntu-22.04
+    needs: report
+    if: failure()
+    steps:
+    - name: Auto-patch CVEs
+      uses: step-security/auto-patch@v1
+      with:
+        rules-config: ./security/auto-patch-rules.yaml
+        github-token: ${{ secrets.GITHUB_TOKEN }}
