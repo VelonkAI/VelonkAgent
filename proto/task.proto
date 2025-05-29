@@ -1,0 +1,263 @@
+syntax = "proto3";
+
+package velink.task.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "agent.proto";
+
+// ========================
+// Task Service Definition
+// ========================
+service TaskService {
+  // Task lifecycle operations
+  rpc CreateTask(TaskSpec) returns (TaskIdentifier) {};
+  rpc GetTask(TaskQuery) returns (TaskStatus) {};
+  rpc UpdateTask(TaskUpdate) returns (TaskAck) {};
+  
+  // Batch operations
+  rpc BulkCreate(stream TaskSpec) returns (BulkCreateResponse) {};
+  rpc BulkUpdate(stream TaskUpdate) returns (BulkUpdateResponse) {};
+  
+  // Task monitoring
+  rpc StreamProgress(ProgressQuery) returns (stream TaskProgress) {};
+  rpc WatchTasks(TaskFilter) returns (stream TaskEvent) {};
+}
+
+// ========================
+// Core Task Types
+// ========================
+message TaskSpec {
+  string task_type = 1;
+  map<string, Value> parameters = 2;
+  
+  message ResourceRequirements {
+    velink.agent.v1.AgentCapabilities.HardwareSpec min_requirements = 1;
+    velink.agent.v1.AgentCapabilities.HardwareSpec recommended = 2;
+    repeated string required_accelerators = 3;
+  }
+  
+  message Priority {
+    uint32 level = 1;          // 0-100 (higher = more urgent)
+    bool preemptible = 2;
+    google.protobuf.Duration timeout = 3;
+    uint32 max_retries = 4;
+  }
+
+  message Dependencies {
+    repeated string task_ids = 1;
+    map<string, bool> system_deps = 2;  // {database_available: true}
+    map<string, string> version_deps = 3;  // {model_version: "2.1.0"}
+  }
+
+  message Security {
+    string owner = 1;
+    repeated string access_roles = 2;
+    string data_classification = 3;  // public/internal/confidential
+    bool encrypted = 4;
+  }
+
+  ResourceRequirements resources = 3;
+  Priority priority = 4;
+  Dependencies dependencies = 5;
+  Security security = 6;
+  bytes payload = 7;  // Serialized task data
+  map<string, string> labels = 8;
+}
+
+message TaskStatus {
+  enum State {
+    PENDING = 0;
+    QUEUED = 1;
+    SCHEDULED = 2;
+    RUNNING = 3;
+    PAUSED = 4;
+    COMPLETED = 5;
+    FAILED = 6;
+    CANCELED = 7;
+    TIMEOUT = 8;
+  }
+
+  string task_id = 1;
+  State current_state = 2;
+  google.protobuf.Timestamp state_time = 3;
+  
+  message ExecutionInfo {
+    string assigned_agent = 1;
+    google.protobuf.Timestamp start_time = 2;
+    google.protobuf.Timestamp end_time = 3;
+    aelion.agent.v1.SystemMetrics peak_metrics = 4;
+    uint32 retry_count = 5;
+  }
+  
+  message Results {
+    oneof result {
+      google.protobuf.Struct structured = 1;
+      bytes binary = 2;
+      string reference = 3;  // URI to results storage
+    }
+    string result_type = 4;
+    string checksum = 5;
+  }
+
+  message ErrorInfo {
+    velink.agent.v1.ErrorDetail error = 1;
+    string failed_stage = 2;
+    string stack_trace = 3;
+    map<string, Value> context = 4;
+  }
+
+  ExecutionInfo execution = 4;
+  Results output = 5;
+  ErrorInfo error = 6;
+  float progress = 7;  // 0.0-1.0
+  repeated string children = 8;  // Sub-tasks
+}
+
+// ========================
+// Task Operations
+// ========================
+message TaskUpdate {
+  string task_id = 1;
+  
+  oneof operation {
+    PriorityAdjustment reprioritize = 2;
+    ResourceAdjustment scale_resources = 3;
+    DependencyUpdate modify_deps = 4;
+    StateTransition change_state = 5;
+    MetadataUpdate update_meta = 6;
+  }
+  
+  message PriorityAdjustment {
+    uint32 new_level = 1;
+    google.protobuf.Duration new_timeout = 2;
+  }
+
+  message ResourceAdjustment {
+    velink.agent.v1.AgentCapabilities.HardwareSpec new_requirements = 1;
+  }
+
+  message DependencyUpdate {
+    repeated string add_dependencies = 1;
+    repeated string remove_dependencies = 2;
+  }
+
+  message StateTransition {
+    TaskStatus.State target_state = 1;
+    string reason = 2;
+  }
+
+  message MetadataUpdate {
+    map<string, string> add_labels = 1;
+    repeated string remove_labels = 2;
+    bytes new_payload = 3;
+  }
+}
+
+// ========================
+// Monitoring & Events
+// ========================
+message TaskProgress {
+  string task_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  
+  message Metrics {
+    float completion = 1;
+    google.protobuf.Duration elapsed = 2;
+    google.protobuf.Duration estimated_remaining = 3;
+    aelion.agent.v1.SystemMetrics current_resources = 4;
+    map<string, double> custom_metrics = 5;
+  }
+  
+  oneof update {
+    Metrics metrics = 3;
+    StateTransition transition = 4;
+    ErrorEvent error = 5;
+  }
+}
+
+message TaskEvent {
+  enum EventType {
+    CREATED = 0;
+    STATE_CHANGE = 1;
+    PROGRESS_UPDATE = 2;
+    COMPLETED = 3;
+    FAILED = 4;
+    RETRYING = 5;
+    RESCHEDULED = 6;
+  }
+
+  string task_id = 1;
+  EventType type = 2;
+  google.protobuf.Timestamp occurred_at = 3;
+  TaskStatus.State current_state = 4;
+  TaskStatus.State previous_state = 5;
+  string agent_id = 6;  // Responsible agent
+  string details = 7;
+}
+
+// ========================
+// Query & Filter Types
+// ========================
+message TaskFilter {
+  message TimeRange {
+    google.protobuf.Timestamp start = 1;
+    google.protobuf.Timestamp end = 2;
+  }
+
+  message StateFilter {
+    repeated TaskStatus.State includes = 1;
+    repeated TaskStatus.State excludes = 2;
+  }
+
+  repeated string task_ids = 1;
+  repeated string types = 2;
+  StateFilter states = 3;
+  TimeRange created = 4;
+  TimeRange modified = 5;
+  map<string, string> labels = 6;
+  string owner = 7;
+  string agent_id = 8;
+}
+
+message ProgressQuery {
+  string task_id = 1;
+  uint32 update_interval = 2;  // Milliseconds
+  bool include_metrics = 3;
+  bool include_state_changes = 4;
+}
+
+// ========================
+// Response Types
+// ========================
+message BulkCreateResponse {
+  repeated string task_ids = 1;
+  repeated string errors = 2;  // Parallel index errors
+}
+
+message BulkUpdateResponse {
+  map<string, string> results = 1;  // task_id -> "success"/"error"
+}
+
+// ========================
+// Shared Types
+// ========================
+message Value {
+  oneof kind {
+    string string_value = 1;
+    int64 int_value = 2;
+    double double_value = 3;
+    bool bool_value = 4;
+    google.protobuf.Struct struct_value = 5;
+    bytes bytes_value = 6;
+  }
+}
+
+message ErrorEvent {
+  string code = 1;
+  string message = 2;
+  google.protobuf.Timestamp occurred_at = 3;
+  string component = 4;
+  map<string, Value> context = 5;
+}
