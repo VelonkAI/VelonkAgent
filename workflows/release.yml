@@ -1,0 +1,246 @@
+name: Release Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging/production)'
+        required: true
+        default: 'staging'
+        type: choice
+        options: ['staging', 'production']
+      semver:
+        description: 'SemVer bump type (major/minor/patch)'
+        required: true
+        default: 'minor'
+        type: choice
+        options: ['major', 'minor', 'patch']
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYPI_INDEX: https://upload.pypi.org/legacy/
+  AWS_S3_BUCKET: aelion-releases
+  DOCKER_BUILDX_VERSION: v0.11.2
+
+jobs:
+  initialize:
+    name: Initialize Release
+    runs-on: ubuntu-22.04
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+      release_channel: ${{ steps.channel.outputs.release_channel }}
+    steps:
+      - name: Checkout with tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Generate semantic version
+        id: version
+        uses: mathieudutour/github-tag-action@v6.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          release_branches: main
+          tag_prefix: v
+          custom_bump: ${{ inputs.semver }}
+
+      - name: Determine release channel
+        id: channel
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            echo "release_channel=stable" >> $GITHUB_OUTPUT
+          else
+            echo "release_channel=unstable" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Build Artifacts
+    runs-on: ubuntu-22.04
+    needs: initialize
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          version: ${{ env.DOCKER_BUILDX_VERSION }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.initialize.outputs.release_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.initialize.outputs.release_channel }}-latest
+          build-args: |
+            PYTHON_VERSION=3.11
+            RELEASE_CHANNEL=${{ needs.initialize.outputs.release_channel }}
+
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-22.04
+    needs: initialize
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build Python package
+        run: python -m build --sdist --wheel --outdir dist/
+
+      - name: Validate package
+        run: twine check dist/*
+
+      - name: Publish to PyPI
+        if: ${{ inputs.environment == 'production' }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload --skip-existing --verbose dist/*
+
+  deploy-docs:
+    name: Deploy Documentation
+    runs-on: ubuntu-22.04
+    needs: [initialize, build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install MkDocs
+        run: pip install mkdocs-material mkdocs-redirects
+
+      - name: Build docs
+        run: mkdocs build --strict --site-dir public/
+
+      - name: Deploy to S3
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+        run: |
+          aws s3 sync public/ s3://${{ env.AWS_S3_BUCKET }}/docs/${{ needs.initialize.outputs.release_version }}/
+          aws s3 sync public/ s3://${{ env.AWS_S3_BUCKET }}/docs/latest/
+
+  security-scan:
+    name: Post-Release Security Scan
+    runs-on: ubuntu-22.04
+    needs: [build, publish-pypi]
+    steps:
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.initialize.outputs.release_version }}
+          format: 'sarif'
+          output: trivy-results.sarif
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: trivy-results.sarif
+
+  notify:
+    name: Release Notification
+    runs-on: ubuntu-22.04
+    needs: [security-scan, deploy-docs]
+    if: always()
+    steps:
+      - name: Generate release notes
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v3
+        with:
+          configuration: |
+            template: |
+              ## Changes
+              {{#each commits}}
+              - {{this.message}} ([{{this.id}}]({{this.url}}))
+              {{/each}}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.initialize.outputs.release_version }}
+          name: ${{ needs.initialize.outputs.release_version }}
+          body: ${{ steps.changelog.outputs.changelog }}
+          prerelease: ${{ inputs.environment != 'production' }}
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+
+      - name: Send Slack notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_WEBHOOK }}
+          SLACK_COLOR: ${{ job.status == 'success' && '#36a64f' || '#ff0000' }}
+          SLACK_TITLE: "Release ${{ needs.initialize.outputs.release_version }} (${{ inputs.environment }})"
+          SLACK_MESSAGE: |
+            Status: ${{ job.status }}
+            Artifacts:
+            - Docker: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.initialize.outputs.release_version }}
+            - PyPI: https://pypi.org/project/aelion-ai/${{ needs.initialize.outputs.release_version }}
+            - Docs: https://docs.aelion.ai/v${{ needs.initialize.outputs.release_version }}
+
+  rollback:
+    name: Rollback Mechanism
+    runs-on: ubuntu-22.04
+    needs: [notify]
+    if: ${{ failure() }}
+    steps:
+      - name: Delete Git tag
+        run: |
+          git push --delete origin ${{ needs.initialize.outputs.release_version }}
+
+      - name: Rollback Docker tags
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.initialize.outputs.release_version }} \
+            && docker rmi ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.initialize.outputs.release_version }}
+
+      - name: Notify rollback
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_WEBHOOK }}
+          SLACK_COLOR: '#ff0000'
+          SLACK_TITLE: "ROLLBACK INITIATED"
+          SLACK_MESSAGE: "Release ${{ needs.initialize.outputs.release_version }} failed - artifacts removed"
