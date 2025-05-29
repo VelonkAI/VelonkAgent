@@ -1,0 +1,332 @@
+# ==============================================
+# Velink AI Agent Deployment - Production Grade
+# ==============================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: velonk-agent
+  namespace: ai-production
+  labels:
+    app.velonk.ai/component: agent
+    app.velonk.ai/version: 4.2.1
+    app.velonk.ai/tier: ai-processing
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9091"
+    prometheus.io/path: "/metrics"
+    elk.io/logs: "true"
+    chaos-mesh.io/inject: "true"
+spec:
+  replicas: 10
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 15%
+  selector:
+    matchLabels:
+      app.velonk.ai/component: agent
+  template:
+    metadata:
+      labels:
+        app.velonk.ai/component: agent
+        app.velonk.ai/version: 4.2.1
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        sidecar.istio.io/inject: "true"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "velonk-agent"
+    spec:
+      # ========================
+      # Pod Security Context
+      # ========================
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 30001
+        fsGroup: 20001
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # ========================
+      # Containers
+      # ========================
+      containers:
+      - name: agent-core
+        image: registry.velonk.ai/core/agent:4.2.1-prod
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 50051
+          name: grpc
+          protocol: TCP
+        
+        # ========================
+        # Resources & Limits
+        # ========================
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+            ephemeral-storage: "10Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+            ephemeral-storage: "20Gi"
+            nvidia.com/gpu: 1
+        
+        # ========================
+        # Probes
+        # ========================
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+            scheme: HTTPS
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        
+        readinessProbe:
+          exec:
+            command: ["/bin/grpc_health_probe", "-addr=:50051"]
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 2
+        
+        # ========================
+        # Environment Config
+        # ========================
+        env:
+        - name: NODE_ENV
+          value: production
+        - name: KAFKA_BROKERS
+          value: "kafka-01.prod.velonk.ai:9093,kafka-02.prod.velonk.ai:9093"
+        - name: REDIS_HOST
+          value: "redis-master.prod.velonk.ai"
+        - name: MODEL_VERSION
+          value: "4.2.1-prod"
+        - name: TF_FORCE_GPU_ALLOW_GROWTH
+          value: "true"
+        - name: GRPC_VERBOSITY
+          value: "ERROR"
+        
+        envFrom:
+        - secretRef:
+            name: agent-secrets
+        - configMapRef:
+            name: agent-config
+        
+        # ========================
+        # Volume Mounts
+        # ========================
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: tmp-volume
+          mountPath: /tmp
+        - name: nvidia-driver
+          mountPath: /usr/local/nvidia
+          readOnly: true
+        
+        # ========================
+        # Lifecycle Hooks
+        # ========================
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 30; kill -SIGTERM 1"]
+      
+      # ========================
+      # Sidecar Containers
+      # ========================
+      - name: istio-proxy
+        image: docker.io/istio/proxyv2:1.16.2
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      
+      # ========================
+      # Volumes
+      # ========================
+      volumes:
+      - name: config-volume
+        configMap:
+          name: agent-config
+          items:
+          - key: "agent.yaml"
+            path: "config.yaml"
+      - name: tmp-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Gi
+      - name: nvidia-driver
+        hostPath:
+          path: /usr/local/nvidia
+          type: Directory
+        
+      # ========================
+      # Affinity Rules
+      # ========================
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: accelerator
+                operator: In
+                values:
+                - nvidia-tesla-a100
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app.velonk.ai/component
+                  operator: In
+                  values:
+                  - agent
+              topologyKey: "kubernetes.io/hostname"
+      
+      # ========================
+      # Tolerations
+      # ========================
+      tolerations:
+      - key: "dedicated"
+        operator: "Equal"
+        value: "ai-processing"
+        effect: "NoSchedule"
+      
+      # ========================
+      # Service Account
+      # ========================
+      serviceAccountName: agent-service-account
+      automountServiceAccountToken: false
+
+---
+# ==============================================
+# Horizontal Pod Autoscaler Configuration
+# ==============================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent-hpa
+  namespace: ai-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: velink-agent
+  minReplicas: 5
+  maxReplicas: 50
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 75
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: grpc_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: 1000
+
+---
+# ==============================================
+# Pod Disruption Budget
+# ==============================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agent-pdb
+  namespace: ai-production
+spec:
+  minAvailable: 70%
+  selector:
+    matchLabels:
+      app.velink.ai/component: agent
+
+---
+# ==============================================
+# Network Policies
+# ==============================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-network-policy
+  namespace: ai-production
+spec:
+  podSelector:
+    matchLabels:
+      app.velink.ai/component: agent
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          network.aelion.ai/access: internal
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 50051
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          network.velink.ai/access: data-services
+    ports:
+    - protocol: TCP
+      port: 9092
+      # Kafka ports
+    - protocol: TCP
+      port: 6379
+      # Redis ports
+
+---
+# ==============================================
+# Priority Class
+# ==============================================
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ai-critical
+value: 1000000
+globalDefault: false
+description: "Priority class for AI processing workloads"
+
+---
+# ==============================================
+# Init Containers
+# ==============================================
+# (Included in main Deployment spec)
+initContainers:
+- name: config-loader
+  image: busybox:1.35
+  command: ['sh', '-c', 'until nslookup config-server; do echo waiting for config server; sleep 2; done']
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "32Mi"
