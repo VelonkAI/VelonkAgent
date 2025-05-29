@@ -1,0 +1,322 @@
+# ==============================================
+# Apache Kafka Production Cluster
+# ==============================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-hs
+  namespace: messaging
+  labels:
+    app.velonk.ai/component: kafka
+spec:
+  clusterIP: None
+  ports:
+  - name: tcp-client
+    port: 9092
+    targetPort: 9092
+  - name: tcp-internal
+    port: 9093
+    targetPort: 9093
+  selector:
+    app.velonk.ai/component: kafka
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-pdb
+  namespace: messaging
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.velonk.ai/component: kafka
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: messaging
+  labels:
+    app.velonk.ai/component: kafka
+spec:
+  serviceName: kafka-hs
+  replicas: 3
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.velink.ai/component: kafka
+  template:
+    metadata:
+      labels:
+        app.velonk.ai/component: kafka
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9404"
+    spec:
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app.velonk.ai/component
+                operator: In
+                values:
+                - kafka
+            topologyKey: "kubernetes.io/hostname"
+      tolerations:
+      - key: "dedicated"
+        operator: "Equal"
+        value: "kafka"
+        effect: "NoSchedule"
+      containers:
+      - name: kafka
+        image: confluentinc/cp-kafka:7.4.0
+        resources:
+          requests:
+            cpu: "2"
+            memory: "8Gi"
+          limits:
+            cpu: "4"
+            memory: "16Gi"
+        ports:
+        - containerPort: 9092
+          name: client
+        - containerPort: 9093
+          name: internal
+        env:
+        - name: KAFKA_BROKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+              apiVersion: v1
+        - name: KAFKA_ZOOKEEPER_CONNECT
+          value: "zookeeper.messaging.svc.cluster.local:2181/kafka"
+        - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+          value: "CLIENT:SSL,INTERNAL:SSL"
+        - name: KAFKA_LISTENERS
+          value: "CLIENT://:9092,INTERNAL://:9093"
+        - name: KAFKA_ADVERTISED_LISTENERS
+          value: "CLIENT://$(HOST_IP).messaging.pod.cluster.local:9092,INTERNAL://$(POD_NAME).kafka-hs.messaging.svc.cluster.local:9093"
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: KAFKA_LOG_DIRS
+          value: "/var/lib/kafka/data"
+        - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+          value: "3"
+        - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+          value: "3"
+        - name: KAFKA_SSL_KEYSTORE_FILENAME
+          value: "kafka.broker.keystore.jks"
+        - name: KAFKA_SSL_KEYSTORE_CREDENTIALS
+          value: "keystore-creds"
+        - name: KAFKA_SSL_KEY_CREDENTIALS
+          value: "keystore-creds"
+        - name: KAFKA_SSL_TRUSTSTORE_FILENAME
+          value: "kafka.broker.truststore.jks"
+        - name: KAFKA_SSL_TRUSTSTORE_CREDENTIALS
+          value: "truststore-creds"
+        volumeMounts:
+        - name: datadir
+          mountPath: /var/lib/kafka
+        - name: config
+          mountPath: /etc/kafka/secrets
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "velonk-broker-api-verify --bootstrap-server localhost:9093 --api-key SSL --api-secret SSL"
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          tcpSocket:
+            port: 9093
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: config
+        secret:
+          secretName: kafka-certs
+  volumeClaimTemplates:
+  - metadata:
+      name: datadir
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: kafka-ssd
+      resources:
+        requests:
+          storage: 2Ti
+---
+# ==============================================
+# Network Policies
+# ==============================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-network-policy
+  namespace: messaging
+spec:
+  podSelector:
+    matchLabels:
+      app.velonk.ai/component: kafka
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          network.velonk.ai/access: internal
+    ports:
+    - port: 9092
+      protocol: TCP
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 10.0.0.0/8
+    ports:
+    - port: 2181
+      protocol: TCP
+---
+# ==============================================
+# Monitoring Service
+# ==============================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-monitor
+  namespace: messaging
+  labels:
+    app.velink.ai/monitoring: kafka
+spec:
+  type: ClusterIP
+  ports:
+  - name: jmx
+    port: 5556
+    targetPort: 5556
+  selector:
+    app.velonk.ai/component: kafka
+---
+# ==============================================
+# Kafka Configuration ConfigMap
+# ==============================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: messaging
+data:
+  server.properties: |
+    # Broker Configuration
+    broker.id.generation.enable=true
+    auto.create.topics.enable=false
+    delete.topic.enable=true
+    compression.type=zstd
+    num.io.threads=16
+    num.network.threads=32
+    socket.request.max.bytes=104857600
+    num.partitions=16
+    default.replication.factor=3
+    min.insync.replicas=2
+    log.flush.interval.messages=10000
+    log.flush.interval.ms=1000
+    log.retention.hours=168
+    log.segment.bytes=1073741824
+    log.cleanup.policy=delete
+    log.retention.check.interval.ms=300000
+    offsets.topic.replication.factor=3
+    transaction.state.log.replication.factor=3
+    transaction.state.log.min.isr=2
+    # SSL Configuration
+    ssl.keystore.location=/etc/kafka/secrets/kafka.broker.keystore.jks
+    ssl.keystore.password=${KAFKA_SSL_KEYSTORE_CREDENTIALS}
+    ssl.key.password=${KAFKA_SSL_KEY_CREDENTIALS}
+    ssl.truststore.location=/etc/kafka/secrets/kafka.broker.truststore.jks
+    ssl.truststore.password=${KAFKA_SSL_TRUSTSTORE_CREDENTIALS}
+    ssl.client.auth=required
+    ssl.endpoint.identification.algorithm=
+    ssl.secure.random.implementation=SHA1PRNG
+    # JMX Configuration
+    KAFKA_JMX_OPTS=-Dcom.sun.management.jmxremote=true
+                   -Dcom.sun.management.jmxremote.authenticate=false
+                   -Dcom.sun.management.jmxremote.ssl=false
+                   -Djava.rmi.server.hostname=127.0.0.1
+                   -Dcom.sun.management.jmxremote.port=5556
+    # JVM Options
+    KAFKA_HEAP_OPTS=-Xmx12G -Xms12G
+    KAFKA_JVM_PERFORMANCE_OPTS=-server
+                              -XX:+UseG1GC
+                              -XX:MaxGCPauseMillis=20
+                              -XX:InitiatingHeapOccupancyPercent=35
+                              -XX:+ExplicitGCInvokesConcurrent
+                              -XX:MaxInlineLevel=15
+                              -Djava.awt.headless=true
+---
+# ==============================================
+# ZooKeeper Ensemble (Dependency)
+# ==============================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zookeeper
+  namespace: messaging
+spec:
+  serviceName: zookeeper-hs
+  replicas: 3
+  selector:
+    matchLabels:
+      app.velonk.ai/component: zookeeper
+  template:
+    metadata:
+      labels:
+        app.velonk.ai/component: zookeeper
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app.velonk.ai/component
+                operator: In
+                values:
+                - zookeeper
+            topologyKey: "kubernetes.io/hostname"
+      containers:
+      - name: zookeeper
+        image: confluentinc/cp-zookeeper:7.4.0
+        env:
+        - name: ZOOKEEPER_SERVER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: ZOOKEEPER_SERVERS
+          value: "zookeeper-0.zookeeper-hs:2888:3888;zookeeper-1.zookeeper-hs:2888:3888;zookeeper-2.zookeeper-hs:2888:3888"
+        - name: ZOOKEEPER_CLIENT_PORT
+          value: "2181"
+        volumeMounts:
+        - name: datadir
+          mountPath: /var/lib/zookeeper
+  volumeClaimTemplates:
+  - metadata:
+      name: datadir
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: zk-ssd
+      resources:
+        requests:
+          storage: 500Gi
