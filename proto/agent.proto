@@ -1,0 +1,244 @@
+syntax = "proto3";
+
+package velink.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// Core Agent Service Definition
+service AgentService {
+  // Agent registration and lifecycle
+  rpc RegisterAgent(AgentRegistration) returns (RegistrationResponse) {};
+  rpc DeregisterAgent(AgentIdentifier) returns (DeregistrationResponse) {};
+  
+  // Task management
+  rpc SubmitTask(TaskRequest) returns (TaskAcknowledgement) {};
+  rpc StreamTasks(stream TaskProgress) returns (stream TaskCommand) {};
+  
+  // Cluster coordination
+  rpc Heartbeat(stream AgentStatus) returns (stream ClusterState) {};
+  rpc SyncState(StateSyncRequest) returns (StateSnapshot) {};
+  
+  // Resource negotiation
+  rpc BidOnTask(TaskBid) returns (BidResponse) {};
+  rpc AllocateResources(ResourceRequest) returns (ResourceAllocation) {};
+}
+
+// ========================
+// Core Data Types
+// ========================
+
+message AgentIdentifier {
+  string uuid = 1;          // Universally unique agent ID
+  string agent_type = 2;    // NLP/RL/CV/DataProcessor
+  string instance_id = 3;   // Cloud instance identifier
+  string region = 4;        // Deployment region
+}
+
+message AgentCapabilities {
+  message HardwareSpec {
+    uint32 cpu_cores = 1;
+    uint64 memory_mb = 2;
+    uint64 disk_gb = 3;
+    repeated string accelerators = 4;  // GPU/TPU types
+  }
+
+  message SoftwareStack {
+    string framework_version = 1;
+    repeated string libraries = 2;
+    map<string, string> dependencies = 3;
+  }
+
+  HardwareSpec hardware = 1;
+  SoftwareStack software = 2;
+  repeated string skills = 3;          // NLP/ImageProcessing/etc
+  map<string, bool> features = 4;      // Feature flags
+}
+
+message AgentStatus {
+  AgentIdentifier id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  
+  enum StatusCode {
+    IDLE = 0;
+    PROCESSING = 1;
+    MAINTENANCE = 2;
+    OVERLOADED = 3;
+    ERROR = 4;
+  }
+  
+  StatusCode status = 3;
+  SystemMetrics metrics = 4;
+  TaskLoad current_load = 5;
+  repeated string active_tasks = 6;
+}
+
+message SystemMetrics {
+  message CpuUsage {
+    double user = 1;
+    double system = 2;
+    double idle = 3;
+  }
+
+  message MemoryUsage {
+    uint64 total = 1;
+    uint64 used = 2;
+    uint64 cached = 3;
+  }
+
+  message NetworkStats {
+    uint64 bytes_sent = 1;
+    uint64 bytes_recv = 2;
+    uint32 packet_loss = 3;
+  }
+
+  CpuUsage cpu = 1;
+  MemoryUsage memory = 2;
+  NetworkStats network = 3;
+  map<string, double> accelerator_usage = 4;  // GPU/TPU metrics
+  google.protobuf.Duration uptime = 5;
+}
+
+// ========================
+// Task Management Types
+// ========================
+
+message TaskRequest {
+  string task_id = 1;
+  string task_type = 2;
+  google.protobuf.Struct parameters = 3;
+  
+  message PrioritySettings {
+    uint32 qos_class = 1;    // 0-7 (similar to Linux nice)
+    bool preemptible = 2;
+    google.protobuf.Duration deadline = 3;
+  }
+  
+  PrioritySettings priority = 4;
+  repeated string dependencies = 5;
+  bytes payload = 6;         // Serialized task data
+}
+
+message TaskProgress {
+  string task_id = 1;
+  AgentIdentifier agent_id = 2;
+  
+  oneof update {
+    ProgressMetrics metrics = 3;
+    ErrorDetail error = 4;
+    TaskOutput output = 5;
+  }
+  
+  message ProgressMetrics {
+    double completion = 1;   // 0.0-1.0
+    google.protobuf.Duration elapsed = 2;
+    google.protobuf.Duration estimated_remaining = 3;
+    map<string, double> custom_metrics = 4;
+  }
+}
+
+message TaskCommand {
+  string task_id = 1;
+  
+  oneof command {
+    CancelInstruction cancel = 2;
+    PriorityAdjustment reprioritize = 3;
+    ResourceAdjustment scale_resources = 4;
+    CheckpointRequest checkpoint = 5;
+  }
+}
+
+// ========================
+// Cluster Coordination Types  
+// ========================
+
+message ClusterState {
+  message MemberState {
+    AgentIdentifier id = 1;
+    AgentStatus status = 2;
+    double load_factor = 3;  // 0.0-1.0 utilization
+  }
+
+  google.protobuf.Timestamp timestamp = 1;
+  repeated MemberState members = 2;
+  string leader_id = 3;
+  map<string, string> configuration = 4;  // Cluster-wide settings
+}
+
+message StateSyncRequest {
+  enum SyncMode {
+    FULL_STATE = 0;
+    DELTA_UPDATE = 1;
+    CHECKPOINT_RESTORE = 2;
+  }
+  
+  SyncMode mode = 1;
+  string checkpoint_id = 2;
+  google.protobuf.Timestamp since = 3;
+}
+
+// ========================
+// Resource Negotiation Types
+// ========================
+
+message TaskBid {
+  message ResourceOffer {
+    map<string, uint32> cpu_cores = 1;      // Per-accelerator type
+    map<string, uint64> memory_mb = 2;
+    map<string, double> accelerator_share = 3;  // GPU/TPU allocation
+    google.protobuf.Duration estimated_duration = 4;
+  }
+
+  string task_id = 1;
+  AgentIdentifier bidder = 2;
+  ResourceOffer offer = 3;
+  double confidence_score = 4;  // 0.0-1.0
+}
+
+message ResourceAllocation {
+  message GrantedResources {
+    uint32 cpu_cores = 1;
+    uint64 memory_mb = 2;
+    uint64 disk_gb = 3;
+    map<string, uint32> accelerators = 4;
+    google.protobuf.Duration lease_duration = 5;
+  }
+
+  string allocation_id = 1;
+  GrantedResources resources = 2;
+  map<string, string> constraints = 3;  // Isolation/placement rules
+}
+
+// ========================
+// Error Handling
+// ========================
+
+message ErrorDetail {
+  enum ErrorCode {
+    RESOURCE_EXHAUSTED = 0;
+    DEADLINE_EXCEEDED = 1;
+    TASK_CONFLICT = 2;
+    VERSION_MISMATCH = 3;
+    NETWORK_FAILURE = 4;
+    AUTHORIZATION_FAILED = 5;
+  }
+  
+  ErrorCode code = 1;
+  string message = 2;
+  map<string, string> context = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  string stack_trace = 5;
+}
+
+// ========================
+// Metadata Headers
+// ========================
+
+message RequestMetadata {
+  string correlation_id = 1;
+  string auth_token = 2;
+  string trace_id = 3;       // Distributed tracing ID
+  string client_version = 4;
+  map<string, string> tags = 5;
+}
